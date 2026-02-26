@@ -24,6 +24,7 @@ namespace FrontlineMap
         internal static ConfigEntry<float> cfgWeightShip;
         internal static ConfigEntry<float> cfgWeightVehicle;
         internal static ConfigEntry<float> cfgWeightAircraft;
+        internal static ConfigEntry<bool> cfgUseFixedColors;
 
         static FrontlineHelper helperInstance;
 
@@ -46,6 +47,9 @@ namespace FrontlineMap
             cfgWeightShip = Config.Bind("Weights", "Ship", 5f, "Ship influence weight");
             cfgWeightVehicle = Config.Bind("Weights", "Vehicle", 3f, "Ground vehicle influence weight");
             cfgWeightAircraft = Config.Bind("Weights", "Aircraft", 0.5f, "Aircraft influence weight");
+
+            cfgUseFixedColors = Config.Bind("Visual", "UseFixedColors", true,
+                "Use fixed Red/Blue colors instead of faction colors");
 
             // Create helper on scene load (same pattern as NOAIBridge)
             SceneManager.sceneLoaded += (scene, mode) =>
@@ -195,13 +199,29 @@ namespace FrontlineMap
                 hq0 = null; hq1 = null;
                 color0 = Color.blue; color1 = Color.red;
 
+                FactionHQ localHq = null;
+                try { GameManager.GetLocalHQ(out localHq); } catch { }
+
                 for (int i = 0; i < factions.Count; i++)
                 {
                     Faction f = factions[i];
                     FactionHQ fhq = FactionRegistry.HQFromFaction(f);
                     if (fhq == null) continue;
-                    if (hq0 == null) { hq0 = fhq; color0 = f.color; }
-                    else if (hq1 == null) { hq1 = fhq; color1 = f.color; break; }
+                    if (hq0 == null) { hq0 = fhq; if (!cfgUseFixedColors.Value) color0 = f.color; }
+                    else if (hq1 == null) { hq1 = fhq; if (!cfgUseFixedColors.Value) color1 = f.color; break; }
+                }
+
+                // Fixed colors: friendly=blue, enemy=red based on local player
+                if (cfgUseFixedColors.Value && localHq != null && hq0 != null && hq1 != null)
+                {
+                    if (localHq == hq0)
+                    {
+                        color0 = Color.blue; color1 = Color.red;
+                    }
+                    else if (localHq == hq1)
+                    {
+                        color0 = Color.red; color1 = Color.blue;
+                    }
                 }
 
                 return hq0 != null && hq1 != null;
