@@ -31,8 +31,8 @@ namespace FrontlineMap
         {
             Log = Logger;
 
-            cfgGridRes = Config.Bind("General", "GridResolution", 400,
-                new ConfigDescription("Influence grid resolution", new AcceptableValueRange<int>(64, 512)));
+            cfgGridRes = Config.Bind("General", "GridResolution", 512,
+                new ConfigDescription("Influence grid resolution", new AcceptableValueRange<int>(64, 2048)));
             cfgUpdateInterval = Config.Bind("General", "UpdateInterval", 5f,
                 "Seconds between frontline recalculation");
             cfgInfluenceRadius = Config.Bind("General", "InfluenceRadius", 12000f,
@@ -222,6 +222,10 @@ namespace FrontlineMap
                 float radius = cfgInfluenceRadius.Value;
                 float radiusSq = radius * radius;
 
+                // Get local player's HQ for visibility filtering
+                FactionHQ localHq = null;
+                try { GameManager.GetLocalHQ(out localHq); } catch { }
+
                 foreach (Unit unit in UnitRegistry.allUnits)
                 {
                     if (unit == null) continue;
@@ -236,6 +240,12 @@ namespace FrontlineMap
                     else if (hq == hq1) sign = -1f;
                     else continue;
 
+                    // Visibility filter: only use enemy units that are tracked by our datalink
+                    if (localHq != null && hq != localHq)
+                    {
+                        if (!localHq.IsTargetBeingTracked(unit)) continue;
+                    }
+
                     float weight = GetUnitWeight(unit);
                     if (weight <= 0f) continue;
 
@@ -243,7 +253,7 @@ namespace FrontlineMap
                     StampInfluence(gp.x, gp.z, sign * weight, halfMap, cellSize, radius, radiusSq);
                 }
 
-                // Airbases (not in UnitRegistry)
+                // Airbases (not in UnitRegistry) - always visible (static positions)
                 try
                 {
                     foreach (var kvp in FactionRegistry.airbaseLookup)
@@ -316,17 +326,66 @@ namespace FrontlineMap
                 byte c1g = (byte)(Mathf.Clamp01(color1.g) * 255);
                 byte c1b = (byte)(Mathf.Clamp01(color1.b) * 255);
 
-                // First pass: clear + territory tint
+                // Single pass: territory tint + smooth anti-aliased frontline
+                float lineWidthSq = 0.7f * 0.7f; // squared half-width
+                float dashThreshSq = 0.15f * 0.15f;
+
                 for (int x = 0; x < gridRes; x++)
                 {
                     for (int y = 0; y < gridRes; y++)
                     {
                         float val = influenceGrid[x, y];
                         int idx = y * gridRes + x;
+                        float absVal = val > 0 ? val : -val;
 
-                        if (Mathf.Abs(val) > 0.01f)
+                        // Fast path: skip cells far from zero
+                        if (absVal > 5f)
                         {
-                            float strength = Mathf.Clamp01(Mathf.Abs(val) * 0.02f);
+                            float strength = absVal * 0.02f;
+                            if (strength > 1f) strength = 1f;
+                            byte a = (byte)(strength * territoryAlpha * 255f);
+                            if (a < 2) { pixels[idx] = clear; }
+                            else if (val > 0)
+                                pixels[idx] = new Color32(c0r, c0g, c0b, a);
+                            else
+                                pixels[idx] = new Color32(c1r, c1g, c1b, a);
+                            continue;
+                        }
+
+                        // Near-zero: compute gradient (no sqrt)
+                        float gx = 0f, gy = 0f;
+                        if (x > 0 && x < gridRes - 1)
+                            gx = influenceGrid[x + 1, y] - influenceGrid[x - 1, y];
+                        if (y > 0 && y < gridRes - 1)
+                            gy = influenceGrid[x, y + 1] - influenceGrid[x, y - 1];
+                        float gradSq = gx * gx + gy * gy;
+
+                        // distToZero² = absVal² / gradSq, compare with lineWidthSq
+                        float lineAlpha = 0f;
+                        if (gradSq > 0.000001f)
+                        {
+                            float distSq = (absVal * absVal) / gradSq;
+                            if (distSq < lineWidthSq)
+                            {
+                                // lineAlpha = 1 - sqrt(distSq) / lineWidth
+                                // approximate: 1 - distSq / lineWidthSq works for smooth falloff
+                                lineAlpha = 1f - distSq / lineWidthSq;
+
+                                // Dashed line for weak conflicts
+                                if (gradSq < dashThreshSq && (x + y) % 8 < 4)
+                                    lineAlpha = 0f;
+                            }
+                        }
+
+                        if (lineAlpha > 0.01f)
+                        {
+                            byte a = (byte)(lineAlpha * lineAlpha * 255f);
+                            pixels[idx] = new Color32(255, 255, 255, a);
+                        }
+                        else if (absVal > 0.01f)
+                        {
+                            float strength = absVal * 0.02f;
+                            if (strength > 1f) strength = 1f;
                             byte a = (byte)(strength * territoryAlpha * 255f);
                             if (a < 2) { pixels[idx] = clear; continue; }
 
@@ -342,44 +401,14 @@ namespace FrontlineMap
                     }
                 }
 
-                // Second pass: frontline with intensity-based dashing + thickness for minimap
-                for (int x = 1; x < gridRes - 1; x++)
-                {
-                    for (int y = 1; y < gridRes - 1; y++)
-                    {
-                        float val = influenceGrid[x, y];
-
-                        bool isFrontline = ZeroCross(val, influenceGrid[x - 1, y])
-                            || ZeroCross(val, influenceGrid[x + 1, y])
-                            || ZeroCross(val, influenceGrid[x, y - 1])
-                            || ZeroCross(val, influenceGrid[x, y + 1]);
-
-                        if (!isFrontline) continue;
-
-                        // Gradient magnitude = conflict intensity
-                        float gx = influenceGrid[x + 1, y] - influenceGrid[x - 1, y];
-                        float gy = influenceGrid[x, y + 1] - influenceGrid[x, y - 1];
-                        float gradMag = Mathf.Sqrt(gx * gx + gy * gy);
-
-                        // Feature 2: dashed line for weak conflicts, solid for strong
-                        // gradMag < 0.3 = weak → dash pattern (skip every 3rd pixel)
-                        // gradMag >= 0.3 = strong → solid line
-                        bool dashed = gradMag < 0.3f;
-                        if (dashed && ((x + y) % 4 < 2)) continue; // skip = gap in dash
-
-                        Color32 lineCol = new Color32(255, 255, 255, 255);
-
-                        // 1px at 400 res, bilinear filter smooths it
-                        SetPixelSafe(x, y, lineCol);
-                    }
-                }
-
-                // Third pass: frontline shift indicators (Feature 5)
+                // Second pass: frontline shift indicators
                 if (hasPrevGrid)
                 {
-                    for (int x = 2; x < gridRes - 2; x += 3)
+                    int step = gridRes / 64; // ~16 at 1024
+                    if (step < 4) step = 4;
+                    for (int x = 2; x < gridRes - 2; x += step)
                     {
-                        for (int y = 2; y < gridRes - 2; y += 3)
+                        for (int y = 2; y < gridRes - 2; y += step)
                         {
                             float val = influenceGrid[x, y];
 
@@ -389,13 +418,9 @@ namespace FrontlineMap
                                 || ZeroCross(val, influenceGrid[x, y + 1]);
                             if (!isFrontline) continue;
 
-                            // Compare influence shift: positive shift = faction0 advancing
                             float shift = influenceGrid[x, y] - prevInfluenceGrid[x, y];
-                            if (Mathf.Abs(shift) < 0.05f) continue; // no significant change
+                            if (Mathf.Abs(shift) < 0.05f) continue;
 
-                            // Draw small colored dot on advancing side
-                            // Faction0 advancing (shift > 0): dot in faction0 color, offset into faction1 territory
-                            // Faction1 advancing (shift < 0): dot in faction1 color, offset into faction0 territory
                             float gx = influenceGrid[x + 1, y] - influenceGrid[x - 1, y];
                             float gy = influenceGrid[x, y + 1] - influenceGrid[x, y - 1];
                             float gm = Mathf.Sqrt(gx * gx + gy * gy);
@@ -404,27 +429,22 @@ namespace FrontlineMap
                             float ndx = gx / gm;
                             float ndy = gy / gm;
 
-                            // Offset 2-3 pixels in push direction
                             int sign = shift > 0 ? 1 : -1;
                             Color32 shiftCol = shift > 0
-                                ? new Color32(c0r, c0g, c0b, 180)
-                                : new Color32(c1r, c1g, c1b, 180);
+                                ? new Color32(c0r, c0g, c0b, 200)
+                                : new Color32(c1r, c1g, c1b, 200);
 
-                            // Draw a small 3px chevron pointing in advance direction
-                            for (int s = 1; s <= 3; s++)
+                            int chevLen = gridRes / 128; // ~8 at 1024
+                            if (chevLen < 3) chevLen = 3;
+                            for (int s = 1; s <= chevLen; s++)
                             {
                                 int px = x + Mathf.RoundToInt(ndx * s * sign);
                                 int py = y + Mathf.RoundToInt(ndy * s * sign);
                                 SetPixelSafe(px, py, shiftCol);
-                                // Perpendicular spread for visibility
-                                int px1 = px + Mathf.RoundToInt(-ndy);
-                                int py1 = py + Mathf.RoundToInt(ndx);
-                                int px2 = px + Mathf.RoundToInt(ndy);
-                                int py2 = py + Mathf.RoundToInt(-ndx);
-                                if (s < 3)
+                                if (s < chevLen)
                                 {
-                                    SetPixelSafe(px1, py1, shiftCol);
-                                    SetPixelSafe(px2, py2, shiftCol);
+                                    SetPixelSafe(px + Mathf.RoundToInt(-ndy), py + Mathf.RoundToInt(ndx), shiftCol);
+                                    SetPixelSafe(px + Mathf.RoundToInt(ndy), py + Mathf.RoundToInt(-ndx), shiftCol);
                                 }
                             }
                         }
