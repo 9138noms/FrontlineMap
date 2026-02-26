@@ -400,7 +400,10 @@ namespace FrontlineMap
                         if (lineAlpha > 0.01f)
                         {
                             byte a = (byte)(lineAlpha * lineAlpha * 255f);
-                            pixels[idx] = new Color32(255, 255, 255, a);
+                            if (val > 0)
+                                pixels[idx] = new Color32(c0r, c0g, c0b, a);
+                            else
+                                pixels[idx] = new Color32(c1r, c1g, c1b, a);
                         }
                         else if (absVal > 0.01f)
                         {
