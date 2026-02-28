@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using BepInEx;
 using BepInEx.Configuration;
@@ -9,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace FrontlineMap
 {
-    [BepInPlugin("com.yuulf.frontlinemap", "FrontlineMap", "1.0.0")]
+    [BepInPlugin("com.noms.frontlinemap", "FrontlineMap", "1.0.0")]
     public class FrontlineMapPlugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
@@ -25,6 +26,7 @@ namespace FrontlineMap
         internal static ConfigEntry<float> cfgWeightVehicle;
         internal static ConfigEntry<float> cfgWeightAircraft;
         internal static ConfigEntry<bool> cfgUseFixedColors;
+        internal static ConfigEntry<int> cfgSpreadFrames;
 
         static FrontlineHelper helperInstance;
 
@@ -51,6 +53,11 @@ namespace FrontlineMap
             cfgUseFixedColors = Config.Bind("Visual", "UseFixedColors", true,
                 "Use fixed Red/Blue colors instead of faction colors");
 
+            cfgSpreadFrames = Config.Bind("Performance", "SpreadFrames", 10,
+                new ConfigDescription(
+                    "Spread influence computation across N frames (higher = less lag, slower update)",
+                    new AcceptableValueRange<int>(1, 100)));
+
             // Create helper on scene load (same pattern as NOAIBridge)
             SceneManager.sceneLoaded += (scene, mode) =>
             {
@@ -75,18 +82,26 @@ namespace FrontlineMap
             private Texture2D tex;
             private Color32[] pixels;
             private float[,] influenceGrid;
-            private float[,] prevInfluenceGrid;  // previous tick for shift detection
+            private float[,] prevInfluenceGrid;
             private bool hasPrevGrid;
             private bool showOverlay = true;
             private int gridRes;
-            private int frameCount;
+            private float lastUpdateTime;
             private int updateCount;
+            private bool computing;
 
             // Faction cache
             private FactionHQ hq0;
             private FactionHQ hq1;
             private Color color0;
             private Color color1;
+
+            // Cached unit data for coroutine
+            private struct UnitStamp
+            {
+                public float x, z, weightedSign;
+            }
+            private List<UnitStamp> stampList = new List<UnitStamp>(512);
 
             void Awake()
             {
@@ -109,8 +124,6 @@ namespace FrontlineMap
 
             void Update()
             {
-                frameCount++;
-
                 try
                 {
                     if (Input.GetKeyDown(cfgToggleKey.Value))
@@ -123,7 +136,9 @@ namespace FrontlineMap
                 catch { }
 
                 if (!showOverlay) return;
-                if (frameCount % 300 != 0) return; // ~5s at 60fps
+                if (computing) return;
+                if (Time.time - lastUpdateTime < cfgUpdateInterval.Value) return;
+                lastUpdateTime = Time.time;
 
                 try
                 {
@@ -139,15 +154,7 @@ namespace FrontlineMap
                         updateCount++;
                         return;
                     }
-                    // Save previous grid for shift detection
-                    Array.Copy(influenceGrid, prevInfluenceGrid, gridRes * gridRes);
-                    ComputeInfluence();
-                    RenderToTexture();
-                    hasPrevGrid = true;
-
-                    if (updateCount % 5 == 0)
-                        Log.LogInfo($"[FLM] Tick {updateCount} OK");
-                    updateCount++;
+                    StartCoroutine(ComputeAndRenderAsync());
                 }
                 catch (Exception e)
                 {
@@ -155,6 +162,58 @@ namespace FrontlineMap
                         Log.LogError($"[FLM] Error: {e}");
                     updateCount++;
                 }
+            }
+
+            IEnumerator ComputeAndRenderAsync()
+            {
+                computing = true;
+
+                // Swap grids
+                var temp = prevInfluenceGrid;
+                prevInfluenceGrid = influenceGrid;
+                influenceGrid = temp;
+                Array.Clear(influenceGrid, 0, gridRes * gridRes);
+
+                // Phase 1: Collect unit data (fast, one frame)
+                CollectUnitData();
+                yield return null;
+
+                // Phase 2: Stamp influence spread across frames
+                DynamicMap map = null;
+                try { map = SceneSingleton<DynamicMap>.i; } catch { }
+                float mapSize = (map != null) ? map.mapDimension : 100000f;
+                if (mapSize <= 0f) mapSize = 100000f;
+
+                float halfMap = mapSize * 0.5f;
+                float cellSize = mapSize / gridRes;
+                float radius = cfgInfluenceRadius.Value;
+                float radiusSq = radius * radius;
+
+                int spread = Mathf.Max(1, cfgSpreadFrames.Value);
+                int unitsPerFrame = Mathf.Max(1, stampList.Count / spread);
+                for (int i = 0; i < stampList.Count; i++)
+                {
+                    var s = stampList[i];
+                    StampInfluence(s.x, s.z, s.weightedSign, halfMap, cellSize, radiusSq);
+
+                    if ((i + 1) % unitsPerFrame == 0)
+                        yield return null;
+                }
+                yield return null;
+
+                // Phase 3: Render pixels spread across frames
+                RenderToTextureAsync();
+                yield return null;
+
+                // Phase 4: Upload to GPU
+                tex.SetPixels32(pixels);
+                tex.Apply(false);
+
+                hasPrevGrid = true;
+                if (updateCount % 5 == 0)
+                    Log.LogInfo($"[FLM] Tick {updateCount} OK");
+                updateCount++;
+                computing = false;
             }
 
             // ==================== Setup ====================
@@ -229,20 +288,10 @@ namespace FrontlineMap
 
             // ==================== Influence ====================
 
-            void ComputeInfluence()
+            void CollectUnitData()
             {
-                Array.Clear(influenceGrid, 0, gridRes * gridRes);
+                stampList.Clear();
 
-                DynamicMap map = SceneSingleton<DynamicMap>.i;
-                float mapSize = map.mapDimension;
-                if (mapSize <= 0f) mapSize = 100000f;
-
-                float halfMap = mapSize * 0.5f;
-                float cellSize = mapSize / gridRes;
-                float radius = cfgInfluenceRadius.Value;
-                float radiusSq = radius * radius;
-
-                // Get local player's HQ for visibility filtering
                 FactionHQ localHq = null;
                 try { GameManager.GetLocalHQ(out localHq); } catch { }
 
@@ -260,7 +309,6 @@ namespace FrontlineMap
                     else if (hq == hq1) sign = -1f;
                     else continue;
 
-                    // Visibility filter: only use enemy units that are tracked by our datalink
                     if (localHq != null && hq != localHq)
                     {
                         if (!localHq.IsTargetBeingTracked(unit)) continue;
@@ -270,10 +318,10 @@ namespace FrontlineMap
                     if (weight <= 0f) continue;
 
                     GlobalPosition gp = unit.GlobalPosition();
-                    StampInfluence(gp.x, gp.z, sign * weight, halfMap, cellSize, radius, radiusSq);
+                    stampList.Add(new UnitStamp { x = gp.x, z = gp.z, weightedSign = sign * weight });
                 }
 
-                // Airbases (not in UnitRegistry) - always visible (static positions)
+                // Airbases
                 try
                 {
                     foreach (var kvp in FactionRegistry.airbaseLookup)
@@ -289,16 +337,16 @@ namespace FrontlineMap
                         else continue;
 
                         Vector3 pos = ab.transform.position;
-                        StampInfluence(pos.x, pos.z, sign * cfgWeightAirbase.Value,
-                            halfMap, cellSize, radius, radiusSq);
+                        stampList.Add(new UnitStamp { x = pos.x, z = pos.z, weightedSign = sign * cfgWeightAirbase.Value });
                     }
                 }
                 catch { }
             }
 
             void StampInfluence(float worldX, float worldZ, float weightedSign,
-                float halfMap, float cellSize, float radius, float radiusSq)
+                float halfMap, float cellSize, float radiusSq)
             {
+                float radius = Mathf.Sqrt(radiusSq);
                 int minGX = Mathf.Max(0, Mathf.FloorToInt((worldX - radius + halfMap) / cellSize));
                 int maxGX = Mathf.Min(gridRes - 1, Mathf.CeilToInt((worldX + radius + halfMap) / cellSize));
                 int minGZ = Mathf.Max(0, Mathf.FloorToInt((worldZ - radius + halfMap) / cellSize));
@@ -318,8 +366,8 @@ namespace FrontlineMap
 
                         if (distSq < radiusSq)
                         {
-                            float t = 1f - Mathf.Sqrt(distSq) / radius;
-                            influenceGrid[gx, gz] += weightedSign * t * t;
+                            float t = 1f - distSq / radiusSq;
+                            influenceGrid[gx, gz] += weightedSign * t;
                         }
                     }
                 }
@@ -334,7 +382,7 @@ namespace FrontlineMap
 
             // ==================== Rendering ====================
 
-            void RenderToTexture()
+            void RenderToTextureAsync()
             {
                 float territoryAlpha = Mathf.Clamp01(cfgTerritoryAlpha.Value);
                 Color32 clear = new Color32(0, 0, 0, 0);
@@ -346,8 +394,7 @@ namespace FrontlineMap
                 byte c1g = (byte)(Mathf.Clamp01(color1.g) * 255);
                 byte c1b = (byte)(Mathf.Clamp01(color1.b) * 255);
 
-                // Single pass: territory tint + smooth anti-aliased frontline
-                float lineWidthSq = 0.7f * 0.7f; // squared half-width
+                float lineWidthSq = 0.7f * 0.7f;
                 float dashThreshSq = 0.15f * 0.15f;
 
                 for (int x = 0; x < gridRes; x++)
@@ -358,7 +405,6 @@ namespace FrontlineMap
                         int idx = y * gridRes + x;
                         float absVal = val > 0 ? val : -val;
 
-                        // Fast path: skip cells far from zero
                         if (absVal > 5f)
                         {
                             float strength = absVal * 0.02f;
@@ -372,7 +418,6 @@ namespace FrontlineMap
                             continue;
                         }
 
-                        // Near-zero: compute gradient (no sqrt)
                         float gx = 0f, gy = 0f;
                         if (x > 0 && x < gridRes - 1)
                             gx = influenceGrid[x + 1, y] - influenceGrid[x - 1, y];
@@ -380,18 +425,13 @@ namespace FrontlineMap
                             gy = influenceGrid[x, y + 1] - influenceGrid[x, y - 1];
                         float gradSq = gx * gx + gy * gy;
 
-                        // distToZero² = absVal² / gradSq, compare with lineWidthSq
                         float lineAlpha = 0f;
                         if (gradSq > 0.000001f)
                         {
                             float distSq = (absVal * absVal) / gradSq;
                             if (distSq < lineWidthSq)
                             {
-                                // lineAlpha = 1 - sqrt(distSq) / lineWidth
-                                // approximate: 1 - distSq / lineWidthSq works for smooth falloff
                                 lineAlpha = 1f - distSq / lineWidthSq;
-
-                                // Dashed line for weak conflicts
                                 if (gradSq < dashThreshSq && (x + y) % 8 < 4)
                                     lineAlpha = 0f;
                             }
@@ -424,10 +464,10 @@ namespace FrontlineMap
                     }
                 }
 
-                // Second pass: frontline shift indicators
+                // Shift indicators
                 if (hasPrevGrid)
                 {
-                    int step = gridRes / 64; // ~16 at 1024
+                    int step = gridRes / 64;
                     if (step < 4) step = 4;
                     for (int x = 2; x < gridRes - 2; x += step)
                     {
@@ -444,20 +484,21 @@ namespace FrontlineMap
                             float shift = influenceGrid[x, y] - prevInfluenceGrid[x, y];
                             if (Mathf.Abs(shift) < 0.05f) continue;
 
-                            float gx = influenceGrid[x + 1, y] - influenceGrid[x - 1, y];
-                            float gy = influenceGrid[x, y + 1] - influenceGrid[x, y - 1];
-                            float gm = Mathf.Sqrt(gx * gx + gy * gy);
-                            if (gm < 0.01f) continue;
+                            float ggx = influenceGrid[x + 1, y] - influenceGrid[x - 1, y];
+                            float ggy = influenceGrid[x, y + 1] - influenceGrid[x, y - 1];
+                            float gmSq = ggx * ggx + ggy * ggy;
+                            if (gmSq < 0.0001f) continue;
 
-                            float ndx = gx / gm;
-                            float ndy = gy / gm;
+                            float invGm = 1f / Mathf.Sqrt(gmSq);
+                            float ndx = ggx * invGm;
+                            float ndy = ggy * invGm;
 
                             int sign = shift > 0 ? 1 : -1;
                             Color32 shiftCol = shift > 0
                                 ? new Color32(c0r, c0g, c0b, 200)
                                 : new Color32(c1r, c1g, c1b, 200);
 
-                            int chevLen = gridRes / 128; // ~8 at 1024
+                            int chevLen = gridRes / 128;
                             if (chevLen < 3) chevLen = 3;
                             for (int s = 1; s <= chevLen; s++)
                             {
@@ -473,9 +514,6 @@ namespace FrontlineMap
                         }
                     }
                 }
-
-                tex.SetPixels32(pixels);
-                tex.Apply();
             }
 
             void SetPixelSafe(int x, int y, Color32 col)
