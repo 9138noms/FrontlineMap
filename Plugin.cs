@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace FrontlineMap
 {
-    [BepInPlugin("com.noms.frontlinemap", "FrontlineMap", "1.0.0")]
+    [BepInPlugin("com.noms.frontlinemap", "FrontlineMap", "1.3.1")]
     public class FrontlineMapPlugin : BaseUnityPlugin
     {
         internal static ManualLogSource Log;
@@ -25,6 +25,7 @@ namespace FrontlineMap
         internal static ConfigEntry<float> cfgWeightShip;
         internal static ConfigEntry<float> cfgWeightVehicle;
         internal static ConfigEntry<float> cfgWeightAircraft;
+        internal static ConfigEntry<float> cfgWeightBuilding;
         internal static ConfigEntry<bool> cfgUseFixedColors;
         internal static ConfigEntry<int> cfgSpreadFrames;
 
@@ -49,6 +50,7 @@ namespace FrontlineMap
             cfgWeightShip = Config.Bind("Weights", "Ship", 5f, "Ship influence weight");
             cfgWeightVehicle = Config.Bind("Weights", "Vehicle", 3f, "Ground vehicle influence weight");
             cfgWeightAircraft = Config.Bind("Weights", "Aircraft", 0.5f, "Aircraft influence weight");
+            cfgWeightBuilding = Config.Bind("Weights", "Building", 4f, "Building influence weight (AA, radar, etc.)");
 
             cfgUseFixedColors = Config.Bind("Visual", "UseFixedColors", true,
                 "Use fixed Red/Blue colors instead of faction colors");
@@ -375,9 +377,12 @@ namespace FrontlineMap
 
             float GetUnitWeight(Unit unit)
             {
+                if (unit is PilotDismounted) return 0f;
                 if (unit is Aircraft) return cfgWeightAircraft.Value;
                 if (unit is Ship) return cfgWeightShip.Value;
-                return cfgWeightVehicle.Value;
+                if (unit is GroundVehicle) return cfgWeightVehicle.Value;
+                if (unit is Building) return cfgWeightBuilding.Value;
+                return 0f;
             }
 
             // ==================== Rendering ====================
